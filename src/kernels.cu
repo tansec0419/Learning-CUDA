@@ -91,17 +91,21 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
 // 辅助函数：将全局内存的数据加载到共享内存
 template <typename T>
 __device__ void load_to_shared(T* dst, const T* src, int num_elements) {
-  // 这里的 tid 是当前线程在 Block 内的 ID
-  int tid = threadIdx.x;
+  int tid = threadIdx.x;    // 当前线程在Block内的 ID
   int stride = blockDim.x;  // 每次跨越的步长等于线程总数
 
   // 让线程从 tid 开始，每次跳跃 stride，直到搬完 num_elements
-    for (int i = ???; i < ???; i += ???) {
-      dst[i] = src[i];
-    }
+  for (int i = tid; i < num_elements; i += blockDim.x) {
+    dst[i] = src[i];
+  }
 }
 
-__global__ void flash_attention_kernel(/* Add necessary parameters */) {}
+__global__ void flash_attention_kernel(/* Add necessary parameters */) {
+  // 1.获取当前block的身份信息
+  int batch_id = blockIdx.x;
+  int head_id = blockIdx.y;
+  int q_block_id = blockIdx.z;
+}
 
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
@@ -124,6 +128,10 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
   // 3.计算动态shared memory大小
   size_t smem_size = 3 * q_tile_size * head_dim * sizeof(T);
+
+  // 4.启动kernel
+  flash_attention_kernel<<<grid_Dim, block_Dim, smem_size>>>(
+      /* Pass necessary arguments */);
 }
 
 // *********************************************************************
