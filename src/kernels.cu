@@ -33,6 +33,8 @@ __global__ void trace_kernel(const T* d_input, T* d_result, int cols,
     atomicAdd(d_result, d_input[idx]);
   }
 }
+
+template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
   // TODO: Implement the trace function
 
@@ -85,6 +87,23 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  * @param[in] head_dim Dimension size of each attention head
  * @param[in] is_causal Whether to apply causal masking
  */
+
+// 辅助函数：将全局内存的数据加载到共享内存
+template <typename T>
+__device__ void load_to_shared(T* dst, const T* src, int num_elements) {
+  // 这里的 tid 是当前线程在 Block 内的 ID
+  int tid = threadIdx.x;
+  int stride = blockDim.x;  // 每次跨越的步长等于线程总数
+
+  // TODO: 写一个 for 循环
+  // 让线程从 tid 开始，每次跳跃 stride，直到搬完 num_elements
+    for (int i = ???; i < ???; i += ???) {
+      dst[i] = src[i];
+    }
+}
+
+__global__ void flash_attention_kernel(/* Add necessary parameters */) {}
+
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
@@ -92,6 +111,20 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     int query_heads, int kv_heads, int head_dim,
                     bool is_causal) {
   // TODO: Implement the flash attention function
+
+  // 1.设定超参数
+  const int blockSize = 128;
+  const int q_tile_size = 64;
+  const int kv_tile_size = 64;
+
+  // 2.定义grid和block的维度
+  int num_query_blocks = (target_seq_len + q_tile_size - 1) / q_tile_size;
+  // x-batch数量；y-head数量；z-query分块数量
+  dim3 grid_Dim(batch_size, query_heads, num_query_blocks);
+  dim3 block_Dim(blockSize);
+
+  // 3.计算动态shared memory大小
+  size_t smem_size = 3 * q_tile_size * head_dim * sizeof(T);
 }
 
 // *********************************************************************
