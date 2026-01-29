@@ -95,7 +95,6 @@ __device__ void load_to_shared(T* dst, const T* src, int num_elements) {
   int tid = threadIdx.x;
   int stride = blockDim.x;  // 每次跨越的步长等于线程总数
 
-  // TODO: 写一个 for 循环
   // 让线程从 tid 开始，每次跳跃 stride，直到搬完 num_elements
     for (int i = ???; i < ???; i += ???) {
       dst[i] = src[i];
