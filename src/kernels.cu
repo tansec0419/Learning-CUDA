@@ -101,6 +101,9 @@ __device__ void load_to_shared(T* dst, const T* src, int num_elements) {
 }
 
 __global__ void flash_attention_kernel(/* Add necessary parameters */) {
+  // 声明shared memory
+  extern __shared__ float smem[];
+
   // 1.获取当前block的身份信息
   int batch_id = blockIdx.x;
   int head_id = blockIdx.y;
