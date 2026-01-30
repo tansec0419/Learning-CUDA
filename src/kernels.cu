@@ -109,6 +109,7 @@ __global__ void flash_attention_kernel(
     const int head_dim, const int target_seq_len, const int src_seq_len,
     const int query_heads, const int kv_heads, const T* dev_q, const T* dev_k,
     const T* dev_v, T* dev_o, const bool is_causal) {
+  int tid = threadIdx.x;
   // 声明shared memory
   extern __shared__ T smem[];
   T* s_q = smem;
@@ -144,29 +145,76 @@ __global__ void flash_attention_kernel(
   load_2d(s_q, q_ptr, q_tile_size, head_dim, stride_seq_q);
 
   // 初始化累加器
-  float acc[q_tile_size][head_dim] = {0};  // ❌ 寄存器不能这样定义，后面再说
-  float l[q_tile_size] = {0};              // 用于 Softmax 的分母
-  float m[q_tile_size] = {-inf};           // 用于 Softmax 的最大值
+  const int MAX_HEAD_DIM = 128;  // 假设head_dim最大为128
+  float acc[MAX_HEAD_DIM] = {0.0f};
+  float l = 0.0f;       // 用于 Softmax 的分母
+  float m = -INFINITY;  // 用于 Softmax 的最大值
 
   // 遍历所有的 KV Block (外层循环)
   for (int kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
-    // 把当前的 K/V 块搬进 Shared Memory
-    //  这里需要重用 load_2d，但是要注意 src 的指针偏移量
-
     // 计算kv块的起始位置偏移量
-    int current_seq_id = kv_block_idx * kv_tile_size;
-    long long kv_offset = (long long)batch_id * stride_batch_kv +
-                          (long long)(head_id % kv_heads) * stride_head_kv +
-                          (long long)current_seq_id * stride_seq_kv;
+    int src_seq_id = kv_block_idx * kv_tile_size;
+    long long k_offset = (long long)batch_id * stride_batch_kv +
+                         (long long)(head_id % kv_heads) * stride_head_kv +
+                         (long long)src_seq_id * stride_seq_kv;
+    long long v_offset = k_offset;
+
+    // 搬运
+    load_2d(s_k, dev_k + k_offset, kv_tile_size, head_dim, stride_seq_kv);
+    load_2d(s_v, dev_v + v_offset, kv_tile_size, head_dim, stride_seq_kv);
+
     __syncthreads();
 
     // 2.2 计算 Q * K^T (矩阵乘法)
+    if (tid < q_tile_size) {
+      float scale = 1.0f / sqrtf((float)head_dim);  // 缩放因子
+
+      for (int j = 0; j < kv_tile_size; ++j) {
+        float score = 0.0f;  // 计算注意力分数
+
+        for (int d = 0; d < head_dim; ++d) {
+          score += s_q[tid * head_dim + d] * s_k[j * head_dim + d];
+        }
+        score *= scale;
+
+        // 因果掩码casual masking
+        int global_q_idx = tgt_seq_id + tid;
+        int global_k_idx = src_seq_id + j;
+        if (is_causal && global_k_idx > global_q_idx) {
+          score = -INFINITY;  // 掩码掉未来位置
+        }
+
+        // online softmax 相关计算
+        float m_prev = m;                  // 保存上一次的m
+        m = max(m_prev, score);            // 更新m
+        float divisor = expf(m_prev - m);  // 计算分母的缩放因子
+        float term = expf(score - m);      // 计算当前项
+
+        // 更新分母
+        l = l * divisor + term;
+
+        // 更新分子
+        for (int d = 0; d < head_dim; ++d) {
+          acc[d] = acc[d] * divisor + term * s_v[j * head_dim + d];
+        }
+      }
+    }
 
     // 2.3 计算 Softmax
 
     // 2.4 计算 Attention * V
 
     __syncthreads();
+  }
+  // 3.将结果写回全局内存
+  if (tid < q_tile_size) {
+    for (int d = 0; d < head_dim; ++d) {
+      // 计算dev_o的偏移量
+      long long o_offset = (long long)batch_id * stride_batch_q +
+                           (long long)head_id * stride_head_q +
+                           (long long)(tgt_seq_id + tid) stride_seq_q + d;
+      dev_o[o_offset] = acc[d] / l;  // 归一化
+    }
   }
 }
 
@@ -218,8 +266,8 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
   // 4.启动kernel
   flash_attention_kernel<<<grid_Dim, block_Dim, smem_size>>>(
-      q_tile_size, kv_tile_size, head_dim, d_q, d_k, d_v, d_o, target_seq_len,
-      src_seq_len, is_causal);
+      q_tile_size, kv_tile_size, batch_size, head_dim, target_seq_len,
+      src_seq_len, query_heads, kv_heads, d_q, d_k, d_v, d_o, is_causal);
   // 5.将结果从GPU复制回CPU
   cudaMemcpy(h_o.data(), d_o, o_bytes, cudaMemcpyDeviceToHost);
   // 6.释放GPU内存
