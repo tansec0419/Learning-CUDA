@@ -89,18 +89,22 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  * @param[in] is_causal Whether to apply causal masking
  */
 
-// 辅助函数：二维跨步读取将全局内存的数据加载到共享内存
+// 辅助函数：二维跨步读取将全局内存的数据加载到共享内存（添加边界检查）
 template <typename T>
 __device__ void load_2d(T* dst, const T* src, int rows, int cols,
-                        int src_stride) {
-  int tid = threadIdx.x;             // 当前线程在Block内的 ID
-  int total_elements = rows * cols;  // 总元素数量
+                        int src_stride, int max_rows) {
+  int tid = threadIdx.x;
+  int total_elements = rows * cols;
 
-  // 让线程从 tid 开始，每次跳跃 stride，直到搬完 num_elements
   for (int i = tid; i < total_elements; i += blockDim.x) {
     int row = i / cols;
     int col = i % cols;
-    dst[i] = src[row * src_stride + col];
+    // 边界检查：确保不读取超出范围的数据
+    if (row < max_rows) {
+      dst[i] = src[row * src_stride + col];
+    } else {
+      dst[i] = (T)0.0f;  // 填充0
+    }
   }
 }
 
@@ -111,119 +115,107 @@ __global__ void flash_attention_kernel(
     const int query_heads, const int kv_heads, const T* dev_q, const T* dev_k,
     const T* dev_v, T* dev_o, const bool is_causal) {
   int tid = threadIdx.x;
-  extern __shared__ char smem_byte[];         // 声明一个字节数组
-  T* smem = reinterpret_cast<T*>(smem_byte);  // 强转为 T* 使用
+  extern __shared__ char smem_byte[];
+  T* smem = reinterpret_cast<T*>(smem_byte);
 
   T* s_q = smem;
   T* s_k = s_q + q_tile_size * head_dim;
   T* s_v = s_k + kv_tile_size * head_dim;
 
-  // 获取当前block的身份信息
   int batch_id = blockIdx.x;
   int head_id = blockIdx.y;
   int q_block_id = blockIdx.z;
   int tgt_seq_id = q_block_id * q_tile_size;
 
-  // 计算Q步长
-  int stride_head_q = head_dim;                        // head维度的步长
-  int stride_seq_q = query_heads * stride_head_q;      //
-  int stride_batch_q = target_seq_len * stride_seq_q;  // batch维度的步长
+  int stride_head_q = head_dim;
+  int stride_seq_q = query_heads * stride_head_q;
+  int stride_batch_q = target_seq_len * stride_seq_q;
 
-  // 计算当前query块的起始位置偏移量
   long long q_offset = (long long)batch_id * stride_batch_q +
                        (long long)head_id * stride_head_q +
                        (long long)tgt_seq_id * stride_seq_q;
 
-  // 在 Kernel 内部对 K/V 进行分块遍历
+  int stride_head_kv = head_dim;
+  int stride_seq_kv = kv_heads * stride_head_kv;
+  int stride_batch_kv = src_seq_len * stride_seq_kv;
+
+  int kv_head_id = head_id / (query_heads / kv_heads);
+
+  const T* q_ptr = dev_q + q_offset;
+  int actual_q_rows = min(q_tile_size, target_seq_len - tgt_seq_id);
+  load_2d(s_q, q_ptr, q_tile_size, head_dim, stride_seq_q, actual_q_rows);
+
+  __syncthreads();
+
   int num_kv_blocks = (src_seq_len + kv_tile_size - 1) / kv_tile_size;
 
-  // 计算K/V步长
-  int stride_head_kv = head_dim;                      // head维度的步长
-  int stride_seq_kv = kv_heads * stride_head_kv;      //
-  int stride_batch_kv = src_seq_len * stride_seq_kv;  // batch维度的步长
+  if (tid < q_tile_size && (tgt_seq_id + tid) < target_seq_len) {
+    float acc[128] = {0.0f};
+    float l = 0.0f;
+    float m = -INFINITY;
+    int global_q_idx = tgt_seq_id + tid;
+    float scale = 1.0f / sqrtf((float)head_dim);
 
-  // 将query块加载到shared memory
-  const T* q_ptr = dev_q + q_offset;
-  load_2d(s_q, q_ptr, q_tile_size, head_dim, stride_seq_q);
+    for (int kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
+      int src_seq_id = kv_block_idx * kv_tile_size;
+      int actual_kv_rows = min(kv_tile_size, src_seq_len - src_seq_id);
 
-  // 初始化累加器
-  const int MAX_HEAD_DIM = 128;  // 假设head_dim最大为128
-  float acc[MAX_HEAD_DIM] = {0.0f};
-  float l = 0.0f;       // 用于 Softmax 的分母
-  float m = -INFINITY;  // 用于 Softmax 的最大值
+      long long k_offset = (long long)batch_id * stride_batch_kv +
+                           (long long)kv_head_id * stride_head_kv +
+                           (long long)src_seq_id * stride_seq_kv;
+      long long v_offset = k_offset;
 
-  // 遍历所有的 KV Block (外层循环)
-  for (int kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
-    // 计算kv块的起始位置偏移量
-    int src_seq_id = kv_block_idx * kv_tile_size;
-    long long k_offset = (long long)batch_id * stride_batch_kv +
-                         (long long)(head_id % kv_heads) * stride_head_kv +
-                         (long long)src_seq_id * stride_seq_kv;
-    long long v_offset = k_offset;
+      load_2d(s_k, dev_k + k_offset, kv_tile_size, head_dim, stride_seq_kv,
+              actual_kv_rows);
+      load_2d(s_v, dev_v + v_offset, kv_tile_size, head_dim, stride_seq_kv,
+              actual_kv_rows);
 
-    // 搬运
-    load_2d(s_k, dev_k + k_offset, kv_tile_size, head_dim, stride_seq_kv);
-    load_2d(s_v, dev_v + v_offset, kv_tile_size, head_dim, stride_seq_kv);
+      __syncthreads();
 
-    __syncthreads();
+      // 处理当前 KV block
+      for (int j = 0; j < actual_kv_rows; ++j) {
+        int global_k_idx = src_seq_id + j;
 
-    // 2.2 计算 Q * K^T (矩阵乘法)
-    if (tid < q_tile_size) {
-      float scale = 1.0f / sqrtf((float)head_dim);  // 缩放因子
-
-      for (int j = 0; j < kv_tile_size; ++j) {
-        // 边界检查，防止 src_seq_len 不是 64 倍数时读取越界
-        if (src_seq_id + j >= src_seq_len) {
-          break;
-        }
-
-        float score = 0.0f;  // 计算注意力分数
-
+        float score = 0.0f;
         for (int d = 0; d < head_dim; ++d) {
           score +=
               (float)s_q[tid * head_dim + d] * (float)s_k[j * head_dim + d];
         }
         score *= scale;
 
-        // 因果掩码casual masking
-        int global_q_idx = tgt_seq_id + tid;
-        int global_k_idx = src_seq_id + j;
+        // 因果掩码
         if (is_causal && global_k_idx > global_q_idx) {
-          score = -INFINITY;  // 掩码掉未来位置
+          continue;  // 跳过而不是设为 -INF
         }
 
-        // online softmax 相关计算
-        float m_prev = m;                  // 保存上一次的m
-        m = fmaxf(m_prev, score);          // 更新m
-        float divisor = expf(m_prev - m);  // 计算分母的缩放因子
-        float term = expf(score - m);      // 计算当前项
+        // Online softmax 更新
+        float m_prev = m;
+        m = fmaxf(m_prev, score);
 
-        // 更新分母
-        l = l * divisor + term;
+        // 计算缩放因子
+        float exp_m_diff = expf(m_prev - m);
+        float exp_score = expf(score - m);
 
-        // 更新分子
+        // 更新累加器：重新缩放旧值 + 新值
         for (int d = 0; d < head_dim; ++d) {
-          acc[d] = acc[d] * divisor + term * (float)s_v[j * head_dim + d];
+          acc[d] =
+              acc[d] * exp_m_diff + exp_score * (float)s_v[j * head_dim + d];
         }
+
+        // 更新归一化因子
+        l = l * exp_m_diff + exp_score;
       }
+
+      __syncthreads();
     }
 
-    // 2.3 计算 Softmax
-
-    // 2.4 计算 Attention * V
-
-    __syncthreads();
-  }
-  // 3.将结果写回全局内存
-  if (tid < q_tile_size) {
-    // 边界检查，防止 tgt_seq_len 不是 q_tile_size 倍数时写越界
-    if (tgt_seq_id + tid >= target_seq_len) {
+    // 写回结果
+    if (l > 0.0f) {  // 防止除0
       for (int d = 0; d < head_dim; ++d) {
-        // 计算dev_o的偏移量
         long long o_offset = (long long)batch_id * stride_batch_q +
                              (long long)head_id * stride_head_q +
-                             (long long)(tgt_seq_id + tid) * stride_seq_q + d;
-        dev_o[o_offset] = (T)(acc[d] / l);  // 归一化
+                             (long long)global_q_idx * stride_seq_q + d;
+        dev_o[o_offset] = (T)(acc[d] / l);
       }
     }
   }
@@ -259,29 +251,67 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   cudaMemcpy((void*)d_q, h_q.data(), q_bytes, cudaMemcpyHostToDevice);
   cudaMemcpy((void*)d_k, h_k.data(), k_bytes, cudaMemcpyHostToDevice);
   cudaMemcpy((void*)d_v, h_v.data(), v_bytes, cudaMemcpyHostToDevice);
-  cudaMemcpy((void*)d_o, h_o.data(), o_bytes, cudaMemcpyHostToDevice);
+  // cudaMemcpy((void*)d_o, h_o.data(), o_bytes, cudaMemcpyHostToDevice);
 
-  // 1.设定超参数
-  const int blockSize = 128;
-  const int q_tile_size = 64;
-  const int kv_tile_size = 64;
+  // 1.查询设备属性，获取最大共享内存
+  int device;
+  cudaGetDevice(&device);
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, device);
+  size_t max_smem = prop.sharedMemPerBlock;
 
-  // 2.定义grid和block的维度
+  // 2.根据 head_dim 动态调整 tile size
+  int q_tile_size, kv_tile_size, blockSize;
+
+  if (head_dim <= 64) {
+    q_tile_size = 64;
+    kv_tile_size = 64;
+    blockSize = 128;
+  } else if (head_dim <= 128) {
+    q_tile_size = 32;
+    kv_tile_size = 32;
+    blockSize = 64;
+  } else {
+    q_tile_size = 16;
+    kv_tile_size = 16;
+    blockSize = 32;
+  }
+
+  // 3.计算所需共享内存并检查是否超限
+  size_t smem_size = (q_tile_size + 2 * kv_tile_size) * head_dim * sizeof(T);
+
+  // 如果超限，继续缩小 tile size
+  while (smem_size > max_smem && q_tile_size > 8) {
+    q_tile_size /= 2;
+    kv_tile_size /= 2;
+    blockSize /= 2;
+    smem_size = (q_tile_size + 2 * kv_tile_size) * head_dim * sizeof(T);
+  }
+
+  // 4.定义grid和block的维度
   int num_query_blocks = (target_seq_len + q_tile_size - 1) / q_tile_size;
-  // x-batch数量；y-head数量；z-query分块数量
   dim3 grid_Dim(batch_size, query_heads, num_query_blocks);
   dim3 block_Dim(blockSize);
 
-  // 3.计算动态shared memory大小
-  size_t smem_size = 3 * q_tile_size * head_dim * sizeof(T);
-
-  // 4.启动kernel
+  // 5.启动kernel
   flash_attention_kernel<<<grid_Dim, block_Dim, smem_size>>>(
       q_tile_size, kv_tile_size, batch_size, head_dim, target_seq_len,
       src_seq_len, query_heads, kv_heads, d_q, d_k, d_v, d_o, is_causal);
-  // 5.将结果从GPU复制回CPU
+
+  // 6.检查 kernel 启动错误
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    // 如果仍然失败，可以在这里打印错误信息
+    // printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
+  }
+
+  // 7.等待 kernel 完成
+  cudaDeviceSynchronize();
+
+  // 8.将结果从GPU复制回CPU
   cudaMemcpy(h_o.data(), d_o, o_bytes, cudaMemcpyDeviceToHost);
-  // 6.释放GPU内存
+
+  // 9.释放GPU内存
   cudaFree(d_q);
   cudaFree(d_k);
   cudaFree(d_v);
