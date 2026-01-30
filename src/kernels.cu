@@ -88,26 +88,86 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  * @param[in] is_causal Whether to apply causal masking
  */
 
-// 辅助函数：将全局内存的数据加载到共享内存
+// 辅助函数：二维跨步读取将全局内存的数据加载到共享内存
 template <typename T>
-__device__ void load_to_shared(T* dst, const T* src, int num_elements) {
-  int tid = threadIdx.x;    // 当前线程在Block内的 ID
-  int stride = blockDim.x;  // 每次跨越的步长等于线程总数
+__device__ void load_2d(T* dst, const T* src, int rows, int cols,
+                        int src_stride) {
+  int tid = threadIdx.x;             // 当前线程在Block内的 ID
+  int total_elements = rows * cols;  // 总元素数量
 
   // 让线程从 tid 开始，每次跳跃 stride，直到搬完 num_elements
-  for (int i = tid; i < num_elements; i += blockDim.x) {
-    dst[i] = src[i];
+  for (int i = tid; i < total_elements; i += blockDim.x) {
+    int row = i / cols;
+    int col = i % cols;
+    dst[i] = src[row * src_stride + col];
   }
 }
 
-__global__ void flash_attention_kernel(/* Add necessary parameters */) {
+template <typename T>
+__global__ void flash_attention_kernel(
+    const int q_tile_size, const int kv_tile_size, const int batch_size,
+    const int head_dim, const int target_seq_len, const int src_seq_len,
+    const int query_heads, const int kv_heads, const T* dev_q, const T* dev_k,
+    const T* dev_v, T* dev_o, const bool is_causal) {
   // 声明shared memory
-  extern __shared__ float smem[];
+  extern __shared__ T smem[];
+  T* s_q = smem;
+  T* s_k = s_q + q_tile_size * head_dim;
+  T* s_v = s_k + kv_tile_size * head_dim;
 
-  // 1.获取当前block的身份信息
+  // 获取当前block的身份信息
   int batch_id = blockIdx.x;
   int head_id = blockIdx.y;
   int q_block_id = blockIdx.z;
+  int tgt_seq_id = q_block_id * q_tile_size;
+
+  // 计算Q步长
+  int stride_head_q = head_dim;                        // head维度的步长
+  int stride_seq_q = query_heads * stride_head_q;      //
+  int stride_batch_q = target_seq_len * stride_seq_q;  // batch维度的步长
+
+  // 计算当前query块的起始位置偏移量
+  long long q_offset = (long long)batch_id * stride_batch_q +
+                       (long long)head_id * stride_head_q +
+                       (long long)tgt_seq_id * stride_seq_q;
+
+  // 在 Kernel 内部对 K/V 进行分块遍历
+  int num_kv_blocks = (src_seq_len + kv_tile_size - 1) / kv_tile_size;
+
+  // 计算K/V步长
+  int stride_head_kv = head_dim;                      // head维度的步长
+  int stride_seq_kv = kv_heads * stride_head_kv;      //
+  int stride_batch_kv = src_seq_len * stride_seq_kv;  // batch维度的步长
+
+  // 将query块加载到shared memory
+  const T* q_ptr = dev_q + q_offset;
+  load_2d(s_q, q_ptr, q_tile_size, head_dim, stride_seq_q);
+
+  // 初始化累加器
+  float acc[q_tile_size][head_dim] = {0};  // ❌ 寄存器不能这样定义，后面再说
+  float l[q_tile_size] = {0};              // 用于 Softmax 的分母
+  float m[q_tile_size] = {-inf};           // 用于 Softmax 的最大值
+
+  // 遍历所有的 KV Block (外层循环)
+  for (int kv_block_idx = 0; kv_block_idx < num_kv_blocks; ++kv_block_idx) {
+    // 把当前的 K/V 块搬进 Shared Memory
+    //  这里需要重用 load_2d，但是要注意 src 的指针偏移量
+
+    // 计算kv块的起始位置偏移量
+    int current_seq_id = kv_block_idx * kv_tile_size;
+    long long kv_offset = (long long)batch_id * stride_batch_kv +
+                          (long long)(head_id % kv_heads) * stride_head_kv +
+                          (long long)current_seq_id * stride_seq_kv;
+    __syncthreads();
+
+    // 2.2 计算 Q * K^T (矩阵乘法)
+
+    // 2.3 计算 Softmax
+
+    // 2.4 计算 Attention * V
+
+    __syncthreads();
+  }
 }
 
 template <typename T>
@@ -117,6 +177,30 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     int query_heads, int kv_heads, int head_dim,
                     bool is_causal) {
   // TODO: Implement the flash attention function
+
+  // 1.计算字节数
+  size_t q_bytes =
+      batch_size * target_seq_len * query_heads * head_dim * sizeof(T);
+  size_t k_bytes = batch_size * src_seq_len * kv_heads * head_dim * sizeof(T);
+  size_t v_bytes = batch_size * src_seq_len * kv_heads * head_dim * sizeof(T);
+  size_t o_bytes =
+      batch_size * target_seq_len * query_heads * head_dim * sizeof(T);
+
+  // 2.在GPU上分配内存
+  T* d_q;
+  T* d_k;
+  T* d_v;
+  T* d_o;
+  cudaMalloc((void**)&d_q, q_bytes);
+  cudaMalloc((void**)&d_k, k_bytes);
+  cudaMalloc((void**)&d_v, v_bytes);
+  cudaMalloc((void**)&d_o, o_bytes);
+
+  // 3.将数据从CPU复制到GPU
+  cudaMemcpy((void*)d_q, h_q.data(), q_bytes, cudaMemcpyHostToDevice);
+  cudaMemcpy((void*)d_k, h_k.data(), k_bytes, cudaMemcpyHostToDevice);
+  cudaMemcpy((void*)d_v, h_v.data(), v_bytes, cudaMemcpyHostToDevice);
+  cudaMemcpy((void*)d_o, h_o.data(), o_bytes, cudaMemcpyHostToDevice);
 
   // 1.设定超参数
   const int blockSize = 128;
@@ -134,7 +218,15 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
 
   // 4.启动kernel
   flash_attention_kernel<<<grid_Dim, block_Dim, smem_size>>>(
-      /* Pass necessary arguments */);
+      q_tile_size, kv_tile_size, head_dim, d_q, d_k, d_v, d_o, target_seq_len,
+      src_seq_len, is_causal);
+  // 5.将结果从GPU复制回CPU
+  cudaMemcpy(h_o.data(), d_o, o_bytes, cudaMemcpyDeviceToHost);
+  // 6.释放GPU内存
+  cudaFree(d_q);
+  cudaFree(d_k);
+  cudaFree(d_v);
+  cudaFree(d_o);
 }
 
 // *********************************************************************
