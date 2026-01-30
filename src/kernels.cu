@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 
+#include <cmath>
 #include <vector>
 
 #include "../tester/utils.h"
@@ -110,8 +111,9 @@ __global__ void flash_attention_kernel(
     const int query_heads, const int kv_heads, const T* dev_q, const T* dev_k,
     const T* dev_v, T* dev_o, const bool is_causal) {
   int tid = threadIdx.x;
-  // 声明shared memory
-  extern __shared__ T smem[];
+  extern __shared__ char smem_byte[];         // 声明一个字节数组
+  T* smem = reinterpret_cast<T*>(smem_byte);  // 强转为 T* 使用
+
   T* s_q = smem;
   T* s_k = s_q + q_tile_size * head_dim;
   T* s_v = s_k + kv_tile_size * head_dim;
@@ -170,10 +172,16 @@ __global__ void flash_attention_kernel(
       float scale = 1.0f / sqrtf((float)head_dim);  // 缩放因子
 
       for (int j = 0; j < kv_tile_size; ++j) {
+        // 边界检查，防止 src_seq_len 不是 64 倍数时读取越界
+        if (src_seq_id + j >= src_seq_len) {
+          break;
+        }
+
         float score = 0.0f;  // 计算注意力分数
 
         for (int d = 0; d < head_dim; ++d) {
-          score += s_q[tid * head_dim + d] * s_k[j * head_dim + d];
+          score +=
+              (float)s_q[tid * head_dim + d] * (float)s_k[j * head_dim + d];
         }
         score *= scale;
 
@@ -186,7 +194,7 @@ __global__ void flash_attention_kernel(
 
         // online softmax 相关计算
         float m_prev = m;                  // 保存上一次的m
-        m = max(m_prev, score);            // 更新m
+        m = fmaxf(m_prev, score);          // 更新m
         float divisor = expf(m_prev - m);  // 计算分母的缩放因子
         float term = expf(score - m);      // 计算当前项
 
@@ -195,7 +203,7 @@ __global__ void flash_attention_kernel(
 
         // 更新分子
         for (int d = 0; d < head_dim; ++d) {
-          acc[d] = acc[d] * divisor + term * s_v[j * head_dim + d];
+          acc[d] = acc[d] * divisor + term * (float)s_v[j * head_dim + d];
         }
       }
     }
@@ -208,12 +216,15 @@ __global__ void flash_attention_kernel(
   }
   // 3.将结果写回全局内存
   if (tid < q_tile_size) {
-    for (int d = 0; d < head_dim; ++d) {
-      // 计算dev_o的偏移量
-      long long o_offset = (long long)batch_id * stride_batch_q +
-                           (long long)head_id * stride_head_q +
-                           (long long)(tgt_seq_id + tid) stride_seq_q + d;
-      dev_o[o_offset] = acc[d] / l;  // 归一化
+    // 边界检查，防止 tgt_seq_len 不是 q_tile_size 倍数时写越界
+    if (tgt_seq_id + tid >= target_seq_len) {
+      for (int d = 0; d < head_dim; ++d) {
+        // 计算dev_o的偏移量
+        long long o_offset = (long long)batch_id * stride_batch_q +
+                             (long long)head_id * stride_head_q +
+                             (long long)(tgt_seq_id + tid) * stride_seq_q + d;
+        dev_o[o_offset] = (T)(acc[d] / l);  // 归一化
+      }
     }
   }
 }
