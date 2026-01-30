@@ -160,6 +160,9 @@ __global__ void flash_attention_kernel(
       int src_seq_id = kv_block_idx * kv_tile_size;
       int actual_kv_rows = min(kv_tile_size, src_seq_len - src_seq_id);
 
+      // 等待所有线程完成上一轮计算
+      __syncthreads();
+
       long long k_offset = (long long)batch_id * stride_batch_kv +
                            (long long)kv_head_id * stride_head_kv +
                            (long long)src_seq_id * stride_seq_kv;
@@ -176,6 +179,7 @@ __global__ void flash_attention_kernel(
       for (int j = 0; j < actual_kv_rows; ++j) {
         int global_k_idx = src_seq_id + j;
 
+        // 计算 Q * K^T
         float score = 0.0f;
         for (int d = 0; d < head_dim; ++d) {
           score +=
@@ -183,9 +187,14 @@ __global__ void flash_attention_kernel(
         }
         score *= scale;
 
-        // 因果掩码
+        // 因果掩码：设置为 -INF 而不是 continue
         if (is_causal && global_k_idx > global_q_idx) {
-          continue;  // 跳过而不是设为 -INF
+          score = -INFINITY;
+        }
+
+        // 跳过 -INF 的情况
+        if (score == -INFINITY) {
+          continue;
         }
 
         // Online softmax 更新
@@ -196,27 +205,23 @@ __global__ void flash_attention_kernel(
         float exp_m_diff = expf(m_prev - m);
         float exp_score = expf(score - m);
 
+        // 更新归一化因子
+        l = l * exp_m_diff + exp_score;
+
         // 更新累加器：重新缩放旧值 + 新值
         for (int d = 0; d < head_dim; ++d) {
           acc[d] =
               acc[d] * exp_m_diff + exp_score * (float)s_v[j * head_dim + d];
         }
-
-        // 更新归一化因子
-        l = l * exp_m_diff + exp_score;
       }
-
-      __syncthreads();
     }
 
     // 写回结果
-    if (l > 0.0f) {  // 防止除0
-      for (int d = 0; d < head_dim; ++d) {
-        long long o_offset = (long long)batch_id * stride_batch_q +
-                             (long long)head_id * stride_head_q +
-                             (long long)global_q_idx * stride_seq_q + d;
-        dev_o[o_offset] = (T)(acc[d] / l);
-      }
+    for (int d = 0; d < head_dim; ++d) {
+      long long o_offset = (long long)batch_id * stride_batch_q +
+                           (long long)head_id * stride_head_q +
+                           (long long)global_q_idx * stride_seq_q + d;
+      dev_o[o_offset] = (l > 0.0f) ? (T)(acc[d] / l) : (T)0.0f;
     }
   }
 }
