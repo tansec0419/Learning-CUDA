@@ -10,32 +10,51 @@ struct NF4Data {
   int32_t blocksize;
 
   std::vector<uint8_t> packed;
+  std::vector<uint8_t> absmax_q;
+  std::vector<uint16_t> absmax2;
+  std::vector<uint16_t> code2;
+
+  float offset;
 };
 
 NF4Data load_nf4(std::string filename) {
   std::ifstream f(filename, std::ios::binary);
 
-  NF4Data data;
+  NF4Data d;
 
-  f.read((char*)&data.rows, sizeof(int64_t));
-  f.read((char*)&data.cols, sizeof(int64_t));
-  f.read((char*)&data.blocksize, sizeof(int32_t));
+  f.read((char*)&d.rows, sizeof(int64_t));
+  f.read((char*)&d.cols, sizeof(int64_t));
+  f.read((char*)&d.blocksize, sizeof(int32_t));
 
-  size_t packed_size = (data.rows * data.cols + 1) / 2;
+  int num_weights = d.rows * d.cols;
 
-  data.packed.resize(packed_size);
+  int packed_size = num_weights / 2;
 
-  f.read((char*)data.packed.data(), packed_size);
+  int num_blocks = num_weights / d.blocksize;
 
-  return data;
+  int num_groups = num_blocks / 256 + 1;
+
+  d.packed.resize(packed_size);
+  d.absmax_q.resize(num_blocks);
+  d.absmax2.resize(num_groups);
+  d.code2.resize(256);
+
+  f.read((char*)d.packed.data(), packed_size);
+  f.read((char*)d.absmax_q.data(), num_blocks);
+  f.read((char*)d.absmax2.data(), num_groups * 2);
+  f.read((char*)d.code2.data(), 256 * 2);
+
+  f.read((char*)&d.offset, sizeof(float));
+
+  return d;
 }
 
 int main() {
   NF4Data d = load_nf4("input.bin");
 
-  std::cout << d.rows << std::endl;
-  std::cout << d.cols << std::endl;
-  std::cout << d.blocksize << std::endl;
+  std::cout << "rows: " << d.rows << std::endl;
+  std::cout << "cols: " << d.cols << std::endl;
+  std::cout << "blocksize: " << d.blocksize << std::endl;
 
-  std::cout << d.packed[0] << std::endl;
+  std::cout << "packed size: " << d.packed.size() << std::endl;
 }
