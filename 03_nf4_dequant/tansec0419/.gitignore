@@ -1,0 +1,14 @@
+# 过滤编译产物
+build/
+bin/
+*.o
+*.out
+
+# 过滤数据文件
+*.bin
+data/*.bin
+
+# 过滤性能分析报告（非常大，绝对别传）
+*.ncu-rep
+*.nsys-rep
+*.sqlite
